@@ -1,5 +1,5 @@
 # BOOTH「VRChat」タグからランダム抽選 → テキスト＋リンクでXに自動投稿（Freeプラン）
-# 人間味UP：テンプレゆらぎ＋絵文字＋価格/ショップ名補完＋タグローテ
+# “人間味”アップ：可変テンプレ、絵文字、価格・ショップ名、軽いハッシュタグローテ
 # 依存: pip install tweepy requests beautifulsoup4
 import os, re, json, time, logging, random
 import requests
@@ -9,12 +9,12 @@ import tweepy
 # ====== 設定 ======
 BASE_URL = "https://booth.pm/ja/search/VRChat?sort=new&in_stock=true"
 PAGES_TO_SCRAPE = 5
-SAMPLE_SIZE = 1
+SAMPLE_SIZE = 1             # 45分に1本など想定なので1件で十分
 AVOID_REPEAT_DAYS = 14
 SLEEP_BETWEEN_POSTS_SEC = 2
 STATE_FILE = "random_seen.json"
 
-# X 認証
+# X 認証（v2 ユーザーコンテキスト）
 API_KEY = os.environ.get("X_API_KEY")
 API_SECRET = os.environ.get("X_API_SECRET")
 ACCESS_TOKEN = os.environ.get("X_ACCESS_TOKEN")
@@ -23,16 +23,19 @@ ACCESS_SECRET = os.environ.get("X_ACCESS_SECRET")
 HEADERS = {"User-Agent": "Mozilla/5.0 (+bot contact: youremail@example.com)"}
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# テンプレ
+# 文面テンプレ（{title} {price} {shop} {url} を差し込み／shopは取れた時のみ）
 TEMPLATES = [
     "🎲 ランダム発掘 [VRChat]\n{title}{price} {shop}\n{url}\n{tags}",
     "🆕 いまの気分でコレ [VRChat]\n{title}{price} {shop}\n{url}\n{tags}",
     "👀 ちょい見せピック [VRChat]\n{title}{price} {shop}\n{url}\n{tags}",
     "✨ 今日のおすすめ [VRChat]\n{title}{price} {shop}\n{url}\n{tags}",
 ]
+
+# タグは固定 + たまに1個だけ追加（入れ替え）
 BASE_TAGS = ["#VRChat", "#booth_pm"]
 EXTRA_TAGS_POOL = ["#3Dモデル", "#VRoid", "#アバター", "#ワールド", "#衣装", "#小物"]
-EMOJI_TAILS = ["！", "‼️", "〜", "♪", "⭐", "💫", " "]
+
+EMOJI_TAILS = ["！", "‼️", "〜", "♪", "⭐", "💫", " "]  # 語尾ゆらぎ
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -59,12 +62,18 @@ def fetch_items_from_page(page:int):
     for a in soup.select("a[href*='/items/']"):
         href = a.get("href") or ""
         m = re.search(r"/items/(\d+)", href)
-        if not m:
+        if not m: 
             continue
         item_id = int(m.group(1))
         title = a.get_text(strip=True) or "BOOTH item"
         url = "https://booth.pm" + href if href.startswith("/") else href
-        items.append({"id": item_id, "title": title, "url": url})
+        price = None
+        p = a.parent
+        if p:
+            txt = p.get_text(" ", strip=True)
+            m2 = re.search(r"¥\s?[\d,]+", txt)
+            price = m2.group(0) if m2 else None
+        items.append({"id": item_id, "title": title, "url": url, "price": price})
     return items
 
 def collect_candidates(pages=PAGES_TO_SCRAPE):
@@ -77,42 +86,32 @@ def collect_candidates(pages=PAGES_TO_SCRAPE):
     uniq = {it["id"]: it for it in all_items}
     return list(uniq.values())
 
-def enrich_item_info(item:dict) -> dict:
-    """個別ページを開き、価格とショップ名を補完（失敗してもそのまま返す）"""
+def fetch_shop_name(item_url:str) -> str | None:
+    """個別ページを1回だけ叩いてショップ名らしき文字を拾う（失敗してもOK）"""
     try:
-        r = requests.get(item["url"], headers=HEADERS, timeout=20)
+        r = requests.get(item_url, headers=HEADERS, timeout=20)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-
-        # 価格候補（BOOTHは itemprop="price" が多い。fallbackも用意）
-        price_tag = soup.find("span", {"itemprop": "price"}) or soup.select_one("[data-item-price], .price")
-        price_text = None
-        if price_tag:
-            price_text = price_tag.get_text(" ", strip=True)
-        if not price_text:
-            # テキスト全体から拾う保険
-            m = re.search(r"¥\s?[\d,]+", soup.get_text(" ", strip=True))
-            price_text = m.group(0) if m else None
-        if price_text:
-            item["price"] = "（" + price_text.replace(" ", "") + "）"
-
-        # ショップ名（og:site_name または作者リンク）
-        shop = None
+        # ショップ名はパンくずや作者欄に出ることが多い
+        # まず meta og:site_name を試す
         og = soup.find("meta", {"property": "og:site_name"})
         if og and og.get("content"):
-            shop = og["content"].strip()
-        if not shop:
-            author = soup.select_one("a[href*='/profiles/']")
-            if author:
-                shop = author.get_text(strip=True)
-        if shop:
-            item["shop"] = f"by {shop}"
+            txt = og["content"].strip()
+            if txt:
+                return f"by {txt}"
+        # 代替：作者リンク
+        author = soup.select_one("a[href*='/profiles/']")
+        if author:
+            t = author.get_text(strip=True)
+            if t:
+                return f"by {t}"
     except Exception as e:
-        logging.debug("enrich_item_info failed: %s", e)
-    return item
+        logging.debug("shop fetch fail: %s", e)
+    return None
 
 def build_tags():
     tags = BASE_TAGS[:]
+    # 40%くらいの確率で1個だけ追加タグ
     if random.random() < 0.4:
         tags.append(random.choice(EXTRA_TAGS_POOL))
     return " ".join(tags)
@@ -121,15 +120,18 @@ def shorten(text:str, n:int):
     return (text[:n] + "…") if len(text) > n else text
 
 def build_text(item):
-    title = shorten(item["title"], 80) + random.choice(EMOJI_TAILS)
-    price = item.get("price", "")
-    shop = " " + item["shop"] if item.get("shop") else ""
+    title = shorten(item["title"], 80)
+    price = f"（{item['price']}）" if item.get("price") else ""
+    shop = fetch_shop_name(item["url"])
+    shop_part = f"{shop}" if shop else ""
+    tail = random.choice(EMOJI_TAILS)
     tags = build_tags()
     template = random.choice(TEMPLATES)
-    body = template.format(title=title, price=price, shop=shop, url=item["url"], tags=tags)
+    body = template.format(title=title+tail, price=price, shop=(" " + shop_part if shop_part else ""), url=item["url"], tags=tags)
+    # 文字数セーフティ
     if len(body) > 275:
         title2 = shorten(title, 60)
-        body = template.format(title=title2, price=price, shop=shop, url=item["url"], tags=tags)
+        body = template.format(title=title2+tail, price=price, shop=(" " + shop_part if shop_part else ""), url=item["url"], tags=tags)
     return body
 
 def get_client_v2():
@@ -164,9 +166,6 @@ def main():
     client = get_client_v2()
     posted = 0
     for it in picks:
-        # ★ ここで価格・ショップ名を補完
-        it = enrich_item_info(it)
-
         text = build_text(it)
         try:
             resp = client.create_tweet(text=text)
