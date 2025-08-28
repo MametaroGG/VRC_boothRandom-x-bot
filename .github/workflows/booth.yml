@@ -2,7 +2,7 @@ name: BoothBot
 
 on:
   schedule:
-    - cron: '0 */3 * * *'   # 3時間ごとに実行（UTC基準、日本時間は+9h）
+    - cron: '*/45 * * * *'   # 3時間ごとに実行（UTC基準、日本時間は+9h）
   workflow_dispatch:        # 手動実行も可能
 
 jobs:
