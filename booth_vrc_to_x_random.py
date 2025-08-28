@@ -1,17 +1,19 @@
-# BOOTH「VRChat」タグからランダム抽選 → テキスト＋リンクでXに自動投稿（Freeプラン）
-# “人間味”アップ：可変テンプレ、絵文字、価格・ショップ名、軽いハッシュタグローテ
+# BOOTH「VRChat」タグからランダム抽選 → テキスト＋リンクでXに自動投稿（Freeプラン対応）
+# 投稿末尾に #VRChat #booth_pm を追加
 # 依存: pip install tweepy requests beautifulsoup4
+
 import os, re, json, time, logging, random
 import requests
 from bs4 import BeautifulSoup
 import tweepy
 
-# ====== 設定 ======
+# === 設定 ===
 BASE_URL = "https://booth.pm/ja/search/VRChat?sort=new&in_stock=true"
-PAGES_TO_SCRAPE = 5
-SAMPLE_SIZE = 1             # 45分に1本など想定なので1件で十分
-AVOID_REPEAT_DAYS = 14
-SLEEP_BETWEEN_POSTS_SEC = 2
+PAGES_TO_SCRAPE = 5          # 何ページ分を候補にするか
+SAMPLE_SIZE = 2              # 1回の巡回で何件ポストするか
+AVOID_REPEAT_DAYS = 14       # この日数以内にツイート済みのIDは避ける
+SLEEP_BETWEEN_POSTS_SEC = 2  # 連投防止の間隔
+
 STATE_FILE = "random_seen.json"
 
 # X 認証（v2 ユーザーコンテキスト）
@@ -23,19 +25,6 @@ ACCESS_SECRET = os.environ.get("X_ACCESS_SECRET")
 HEADERS = {"User-Agent": "Mozilla/5.0 (+bot contact: youremail@example.com)"}
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# 文面テンプレ（{title} {price} {shop} {url} を差し込み／shopは取れた時のみ）
-TEMPLATES = [
-    "🎲 ランダム発掘 [VRChat]\n{title}{price} {shop}\n{url}\n{tags}",
-    "🆕 いまの気分でコレ [VRChat]\n{title}{price} {shop}\n{url}\n{tags}",
-    "👀 ちょい見せピック [VRChat]\n{title}{price} {shop}\n{url}\n{tags}",
-    "✨ 今日のおすすめ [VRChat]\n{title}{price} {shop}\n{url}\n{tags}",
-]
-
-# タグは固定 + たまに1個だけ追加（入れ替え）
-BASE_TAGS = ["#VRChat", "#booth_pm"]
-EXTRA_TAGS_POOL = ["#3Dモデル", "#VRoid", "#アバター", "#ワールド", "#衣装", "#小物"]
-
-EMOJI_TAILS = ["！", "‼️", "〜", "♪", "⭐", "💫", " "]  # 語尾ゆらぎ
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -58,15 +47,17 @@ def fetch_items_from_page(page:int):
     r = requests.get(url, headers=HEADERS, timeout=25)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
+
     items = []
     for a in soup.select("a[href*='/items/']"):
         href = a.get("href") or ""
         m = re.search(r"/items/(\d+)", href)
-        if not m: 
-            continue
+        if not m: continue
         item_id = int(m.group(1))
         title = a.get_text(strip=True) or "BOOTH item"
         url = "https://booth.pm" + href if href.startswith("/") else href
+
+        # 価格
         price = None
         p = a.parent
         if p:
@@ -86,53 +77,14 @@ def collect_candidates(pages=PAGES_TO_SCRAPE):
     uniq = {it["id"]: it for it in all_items}
     return list(uniq.values())
 
-def fetch_shop_name(item_url:str) -> str | None:
-    """個別ページを1回だけ叩いてショップ名らしき文字を拾う（失敗してもOK）"""
-    try:
-        r = requests.get(item_url, headers=HEADERS, timeout=20)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        # ショップ名はパンくずや作者欄に出ることが多い
-        # まず meta og:site_name を試す
-        og = soup.find("meta", {"property": "og:site_name"})
-        if og and og.get("content"):
-            txt = og["content"].strip()
-            if txt:
-                return f"by {txt}"
-        # 代替：作者リンク
-        author = soup.select_one("a[href*='/profiles/']")
-        if author:
-            t = author.get_text(strip=True)
-            if t:
-                return f"by {t}"
-    except Exception as e:
-        logging.debug("shop fetch fail: %s", e)
-    return None
-
-def build_tags():
-    tags = BASE_TAGS[:]
-    # 40%くらいの確率で1個だけ追加タグ
-    if random.random() < 0.4:
-        tags.append(random.choice(EXTRA_TAGS_POOL))
-    return " ".join(tags)
-
-def shorten(text:str, n:int):
-    return (text[:n] + "…") if len(text) > n else text
-
 def build_text(item):
-    title = shorten(item["title"], 80)
+    title = item["title"]
     price = f"（{item['price']}）" if item.get("price") else ""
-    shop = fetch_shop_name(item["url"])
-    shop_part = f"{shop}" if shop else ""
-    tail = random.choice(EMOJI_TAILS)
-    tags = build_tags()
-    template = random.choice(TEMPLATES)
-    body = template.format(title=title+tail, price=price, shop=(" " + shop_part if shop_part else ""), url=item["url"], tags=tags)
-    # 文字数セーフティ
-    if len(body) > 275:
-        title2 = shorten(title, 60)
-        body = template.format(title=title2+tail, price=price, shop=(" " + shop_part if shop_part else ""), url=item["url"], tags=tags)
-    return body
+    base = f"🎲 BOOTHランダム [VRChat]\n{title}{price}\n{item['url']}\n#VRChat #booth_pm"
+    if len(base) <= 270:
+        return base
+    short_title = (title[:80] + "…") if len(title) > 80 else title
+    return f"🎲 BOOTHランダム [VRChat]\n{short_title}{price}\n{item['url']}\n#VRChat #booth_pm"
 
 def get_client_v2():
     return tweepy.Client(
@@ -144,7 +96,6 @@ def get_client_v2():
     )
 
 def main():
-    # 認証チェック
     for k, v in {"X_API_KEY": API_KEY, "X_API_SECRET": API_SECRET,
                  "X_ACCESS_TOKEN": ACCESS_TOKEN, "X_ACCESS_SECRET": ACCESS_SECRET}.items():
         if not v:
@@ -158,10 +109,12 @@ def main():
     state = load_state()
     prune_state(state, AVOID_REPEAT_DAYS)
     seen_ids = set(map(int, state.keys()))
-    pool = [it for it in candidates if it["id"] not in seen_ids] or candidates
+    fresh = [it for it in candidates if it["id"] not in seen_ids]
+    pool = fresh if fresh else candidates
 
     random.seed(time.time())
-    picks = random.sample(pool, min(SAMPLE_SIZE, len(pool)))
+    k = min(SAMPLE_SIZE, len(pool))
+    picks = random.sample(pool, k)
 
     client = get_client_v2()
     posted = 0
